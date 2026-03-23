@@ -2,7 +2,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { readFileSync, statSync, realpathSync } from 'fs'
+import { readFileSync, statSync, realpathSync, appendFileSync, writeFileSync, mkdirSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 
@@ -29,6 +29,30 @@ const MAX_CHUNK    = 4096
 const MAX_FILE_MB  = 50 * 1024 * 1024
 const PHOTO_EXTS   = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 
+// ── Per-thread agent directory ────────────────────────────────────────────────
+
+const AGENT_DIR = THREAD_ID
+  ? join(homedir(), '.claude', 'agents', `thread_${THREAD_ID}`)
+  : ''
+
+if (AGENT_DIR) {
+  try { mkdirSync(AGENT_DIR, { recursive: true }) } catch {}
+}
+
+// ── History ───────────────────────────────────────────────────────────────────
+
+interface HistoryEntry {
+  role: 'user' | 'assistant'
+  text: string
+  from?: string
+  ts: number
+}
+
+function appendHistory(entry: HistoryEntry) {
+  if (!AGENT_DIR) return
+  try { appendFileSync(join(AGENT_DIR, 'history.jsonl'), JSON.stringify(entry) + '\n') } catch {}
+}
+
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
 const mcp = new Server(
@@ -38,11 +62,21 @@ const mcp = new Server(
     instructions: THREAD_ID
       ? [
           `You are a Telegram agent for forum topic thread_id=${THREAD_ID}.`,
-          'Run this loop forever:',
+          '',
+          'PRIMARY LOOP — run forever without stopping:',
           '  1. Call wait_for_message',
           '  2. If timeout:true → call wait_for_message again immediately',
-          '  3. If message received → call reply(text="your response"), then go to step 1',
-          'NEVER stop the loop. NEVER output text — only reply() reaches the user.',
+          '  3. If message received → think, call reply(text="your response"), go to step 1',
+          '',
+          'MEMORY RULES:',
+          '  - After learning something important about the user, their preferences or ongoing tasks →',
+          '    call save_memory(content="...") with a concise Markdown summary.',
+          '  - Memory persists across sessions and is shown to you at startup in CLAUDE.md.',
+          '  - Update memory by calling save_memory again (it overwrites, so include all known facts).',
+          '',
+          'STRICT RULES:',
+          '  - NEVER stop the loop. NEVER output text — only reply() reaches the user.',
+          '  - Respond naturally in the language the user writes in.',
         ].join('\n')
       : 'Telegram agent (no thread configured)',
   },
@@ -61,6 +95,13 @@ const msgQueue: any[] = []
 let msgResolver: ((m: any) => void) | null = null
 
 function enqueue(m: any) {
+  // Save to history
+  const text = m.text || m.caption || ''
+  const from = m.from?.first_name
+    ? `${m.from.first_name}${m.from.username ? ` @${m.from.username}` : ''}`
+    : 'User'
+  appendHistory({ role: 'user', text: text || '(no text)', from, ts: Math.floor(Date.now() / 1000) })
+
   if (msgResolver) { msgResolver(m); msgResolver = null }
   else msgQueue.push(m)
 }
@@ -145,15 +186,9 @@ function onProxyMsg(msg: any) {
   if (m.thread_id !== THREAD_ID) return
   if (m.chat_id) chatId = String(m.chat_id)
 
-  const text = m.text || m.caption || ''
   const from = m.from?.first_name
     ? `${m.from.first_name}${m.from.username ? ` @${m.from.username}` : ''}`
     : 'User'
-
-  const parts: string[] = [`${from}: ${text || '(no text)'}`]
-  if (m.photo)    parts.push(`[photo: ${m.photo.file_path || m.photo.file_id}]`)
-  if (m.document) parts.push(`[document: ${m.document.file_name} → ${m.document.file_path || m.document.file_id}]`)
-  if (m.voice?.transcription) parts.push(`[voice: ${m.voice.transcription}]`)
 
   process.stderr.write(`telegram-multi: message queued from ${from}\n`)
   enqueue(m)
@@ -180,6 +215,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           files: { type: 'array', items: { type: 'string' }, description: 'File paths to attach' },
         },
         required: ['text'],
+      },
+    },
+    {
+      name: 'save_memory',
+      description: 'Persist important facts about the user, their preferences and ongoing tasks to memory. This memory is loaded at the start of every future session. Call this whenever you learn something worth remembering. Overwrites previous memory, so include ALL facts each time.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          content: { type: 'string', description: 'Full memory content in Markdown. Include all known user facts, preferences, ongoing tasks.' },
+        },
+        required: ['content'],
       },
     },
     {
@@ -236,18 +282,31 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           assertSendable(f)
           if (statSync(f).size > MAX_FILE_MB) throw new Error(`file too large: ${f}`)
         }
-        for (const c of chunk(String(a.text), MAX_CHUNK))
+        const text = String(a.text)
+        for (const c of chunk(text, MAX_CHUNK))
           sendToProxy({ type: 'send_message', chat_id: cid, thread_id: THREAD_ID, text: c, reply_to: a.reply_to })
         for (const f of files)
           sendToProxy({ type: PHOTO_EXTS.has(extname(f).toLowerCase()) ? 'send_photo' : 'send_document', chat_id: cid, thread_id: THREAD_ID, file_path: f })
+        // Save assistant reply to history
+        appendHistory({ role: 'assistant', text, ts: Math.floor(Date.now() / 1000) })
         return { content: [{ type: 'text', text: 'sent' }] }
       }
+
+      case 'save_memory': {
+        if (!AGENT_DIR) return { content: [{ type: 'text', text: 'error: no thread configured' }], isError: true }
+        writeFileSync(join(AGENT_DIR, 'memory.md'), String(a.content || ''))
+        process.stderr.write('telegram-multi: memory saved\n')
+        return { content: [{ type: 'text', text: 'memory saved' }] }
+      }
+
       case 'react':
         sendToProxy({ type: 'react', chat_id: a.chat_id, message_id: Number(a.message_id), emoji: a.emoji })
         return { content: [{ type: 'text', text: 'reacted' }] }
+
       case 'edit_message':
         sendToProxy({ type: 'edit_message', chat_id: a.chat_id, message_id: Number(a.message_id), text: a.text })
         return { content: [{ type: 'text', text: 'edited' }] }
+
       default:
         return { content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }], isError: true }
     }
@@ -259,5 +318,5 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 await mcp.connect(new StdioServerTransport())
-process.stderr.write(`telegram-multi: MCP ready, thread=${THREAD_ID || 'none'}\n`)
+process.stderr.write(`telegram-multi: MCP ready, thread=${THREAD_ID || 'none'}, agent_dir=${AGENT_DIR || 'none'}\n`)
 connect()
