@@ -1,18 +1,14 @@
 {
-  "name": "claude-agents-local",
+  "name": "telegram-multi",
   "owner": {
-    "name": "local",
-    "url": "https://github.com/Nihao0/claude-agents"
+    "name": "Nihao0",
+    "url": "https://github.com/Nihao0"
   },
   "plugins": [
     {
       "name": "telegram-multi",
-      "description": "Telegram channel plugin for Claude Code — bridges forum topics to Claude sessions via proxy",
-      "version": "1.0.0",
-      "source": {
-        "type": "local",
-        "path": ".."
-      }
+      "description": "Telegram channel plugin for Claude Code",
+      "version": "1.0.0"
     }
   ]
 }
