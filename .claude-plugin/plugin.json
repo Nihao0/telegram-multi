@@ -1,0 +1,6 @@
+{
+  "name": "telegram-multi",
+  "version": "1.0.0",
+  "description": "Telegram channel plugin for Claude Code — connects to proxy server and bridges forum topics to Claude sessions",
+  "channel": true
+}
